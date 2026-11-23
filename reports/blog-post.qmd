@@ -1,0 +1,204 @@
+---
+title: "Does humidity make heat drive electricity demand harder? Evidence from ERCOT, 2025"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(riem)
+```
+
+## Research question
+
+Does the effect of temperature on ERCOT electricity demand depend on how humid the air is?
+I modeled 5 PM demand on warm days (≥ 65°F) as a function of temperature (continuous),
+dew point (categorical: dry / sticky / muggy), and their interaction.
+
+## Causal assumptions (DAG)
+
+```{mermaid}
+flowchart LR
+    Season --> Temp[Temperature]
+    Season --> Dew[Dew point]
+    Hour[Time of day] --> Temp
+    Hour --> Dew
+    Hour --> Demand
+    Temp --> Demand
+    Dew --> Demand
+
+```
+
+I assumed that season affects demand only through weather, so including temperature and dew point
+blocks the backdoor paths through season. Time of day is held constant by using only 5 PM data.
+
+## 1. Data
+
+### Electricity demand (EIA-930)
+
+```{r}
+#| label: read-eia
+
+# load demand data and filter to ERCOT
+ercot <- read_csv(c("data/EIA930_BALANCE_2025_Jan_Jun.csv",
+                    "data/EIA930_BALANCE_2025_Jul_Dec.csv")) |>
+  filter(`Balancing Authority` == "ERCO") |>
+  # create datetime column
+  mutate(datetime = mdy_hms(`UTC Time at End of Hour`))
+```
+
+### Weather (ASOS airport stations via riem)
+
+```{r}
+#| label: read-weather
+
+# put texas stations into a list
+stations <- c("IAH", "DFW", "SAT", "AUS")
+
+weather <- stations |>
+  map(function(station) riem_measures(station,
+                                date_start = "2025-01-01",
+                                date_end   = "2026-01-01")) |>
+  list_rbind() |>
+  # round observation times up to match EIA's hour-ending timestamps
+  mutate(datetime = ceiling_date(valid, "hour")) |>
+  # average within each station and hour
+  summarise(across(c(tmpf, dwpf), \(x) mean(x, na.rm = TRUE)),
+            .by = c(station, datetime)) |>
+  # then average across the four stations
+  summarise(across(c(tmpf, dwpf), \(x) mean(x, na.rm = TRUE)),
+            .by = datetime)
+```
+
+### Join and check
+
+```{r}
+#| label: join
+
+# join data
+all_data <- left_join(ercot, weather, by = join_by(datetime))
+
+# check nas 
+sum(is.na(all_data$datetime))
+sum(is.na(all_data$`Demand (MW)`))
+sum(is.na(all_data$tmpf))
+sum(is.na(all_data$dwpf))
+```
+
+## 2. Analysis sample
+
+Keep hour ending 5 PM Central which is near the daily peak (to control for how time of day impacts demand and temperature), and keep temperature at or above 65°F so the temperature–demand relationship is based solely off of cooling.
+
+```{r}
+#| label: model-data
+model_data <- all_data |>
+  mutate(local_hour = hour(with_tz(datetime, "America/Chicago"))) |>
+  filter(local_hour == 17,
+         tmpf >= 65,
+         !is.na(dwpf), !is.na(`Demand (MW)`)) |>
+  mutate(dew_bin = cut(dwpf,
+                       breaks = c(-Inf, 55, 65, Inf),
+                       labels = c("Dry", "Sticky", "Muggy")),
+         tmpf_c  = tmpf - mean(tmpf))
+
+# Group sizes and temperature range within each dew point bin
+model_data |>
+  summarise(n = n(),
+            min_temp = min(tmpf),
+            max_temp = max(tmpf),
+            .by = dew_bin) |>
+  arrange(dew_bin)
+```
+
+## 3. Exploratory analysis
+
+### Summary statistics
+
+```{r}
+#| label: summary-stats
+model_data |>
+  select(`Demand (MW)`,
+         `Temperature (°F)` = tmpf,
+         `Dew point (°F)`   = dwpf) |>
+  pivot_longer(everything(), names_to = "variable") |>
+  summarise(n      = sum(!is.na(value)),
+            mean   = mean(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            sd     = sd(value, na.rm = TRUE),
+            min    = min(value, na.rm = TRUE),
+            max    = max(value, na.rm = TRUE),
+            .by = variable)
+```
+
+### Distributions
+
+```{r}
+#| label: histograms
+ggplot(model_data, aes(x = `Demand (MW)`)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(title = "5 PM demand, warm days", y = "Count") +
+  theme_minimal(base_size = 13)
+
+ggplot(model_data, aes(x = tmpf)) +
+  geom_histogram(bins = 30, fill = "firebrick", color = "white") +
+  labs(title = "5 PM temperature, warm days", x = "Temperature (°F)", y = "Count") +
+  theme_minimal(base_size = 13)
+```
+
+## 4. Model
+
+```{r}
+#| label: model
+model <- lm(`Demand (MW)` ~ tmpf_c * dew_bin, data = model_data)
+
+summary(model)
+```
+
+### Does the interaction improve the model?
+
+```{r}
+#| label: interaction-test
+model_no_int <- lm(`Demand (MW)` ~ tmpf_c + dew_bin, data = model_data)
+anova(model_no_int, model)
+```
+
+
+## 5. Fitted model
+
+```{r}
+#| label: fitted-plot
+pred_grid <- model_data |>
+  reframe(tmpf = seq(min(tmpf), max(tmpf), length.out = 100), .by = dew_bin) |>
+  mutate(tmpf_c = tmpf - mean(model_data$tmpf))
+
+preds <- pred_grid |>
+  bind_cols(as_tibble(predict(model, newdata = pred_grid, interval = "confidence")))
+
+ggplot() +
+  geom_point(data = model_data,
+             aes(x = tmpf, y = `Demand (MW)`, color = dew_bin),
+             alpha = 0.5, size = 1.8) +
+  geom_ribbon(data = preds,
+              aes(x = tmpf, ymin = lwr, ymax = upr, fill = dew_bin),
+              alpha = 0.15) +
+  geom_line(data = preds,
+            aes(x = tmpf, y = fit, color = dew_bin),
+            linewidth = 1.2) +
+  scale_color_viridis_d(option = "plasma", end = 0.85) +
+  scale_fill_viridis_d(option = "plasma", end = 0.85) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(title = "ERCOT 5 PM demand vs. temperature by dew point, 2025",
+       subtitle = "Days ≥ 65°F; lines are fitted values, bands are 95% CIs (not autocorrelation-corrected)",
+       x = "Temperature (°F)",
+       y = "Demand (MW)",
+       color = "Dew point", fill = "Dew point") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+```
